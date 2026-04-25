@@ -1,0 +1,27 @@
+.git
+.gitignore
+.env
+.env.example
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Big local artefacts — never bake into the image.
+# input_files/*.csv.gz IS baked in (the gzipped CSV ships with the repo).
+# input_files/*.csv is NOT — start.sh regenerates it via gunzip.
+input_files/*.csv
+json_data/
+.cookies/
+credentials/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docs / scripts not needed at runtime
+README.md
+setup.sh

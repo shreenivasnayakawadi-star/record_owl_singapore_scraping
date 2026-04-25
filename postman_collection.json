@@ -1,0 +1,155 @@
+{
+  "info": {
+    "name": "RecordOwl Scraper",
+    "description": "Local + Render testing for the RecordOwl scraper API.\n\nUsage:\n1. Set `baseUrl` to `http://localhost:8000` (compose) or your Render URL.\n2. Hit **Health** to confirm the service is up.\n3. Edit the body of **Cookies — Upload** with your real RecordOwl cookies; sending it kicks off the batch automatically (when AUTO_START_SCRAPE=true).\n4. Watch progress with **Batch Status** / **Completed Count**.\n5. Pull data with **Export Excel** / **Export JSON Archive**.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "recordowl-scraper-collection"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8000",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/health",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "health"]
+        },
+        "description": "Liveness check + current batch status."
+      }
+    },
+    {
+      "name": "Batch — Status",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/batch/status",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "batch", "status"]
+        },
+        "description": "Just the batch_status block: running / current_company / processed / skipped / total."
+      }
+    },
+    {
+      "name": "Completed Count",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/completed/count",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "completed", "count"]
+        },
+        "description": "Totals from companies_completed: total / scraped / failed."
+      }
+    },
+    {
+      "name": "Cookies — Upload (kicks off batch)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"cookies\": [\n    {\n      \"name\": \"sessionid\",\n      \"value\": \"REPLACE_WITH_REAL_VALUE\",\n      \"domain\": \".recordowl.com\",\n      \"path\": \"/\",\n      \"secure\": true,\n      \"httpOnly\": true,\n      \"sameSite\": \"Lax\"\n    },\n    {\n      \"name\": \"csrftoken\",\n      \"value\": \"REPLACE_WITH_REAL_VALUE\",\n      \"domain\": \".recordowl.com\",\n      \"path\": \"/\",\n      \"secure\": true\n    }\n  ]\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/cookies/upload",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "cookies", "upload"]
+        },
+        "description": "Saves the cookies file. If AUTO_START_SCRAPE=true the batch starts immediately using SCRAPE_START_ROW / SCRAPE_END_ROW / INPUT_CSV_FILENAME from env. Replace the placeholder values with your real RecordOwl cookies."
+      }
+    },
+    {
+      "name": "Scrape — Manual (single company)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"company_name\": \"PSA International Pte Ltd\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/scrape/manual",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "scrape", "manual"]
+        },
+        "description": "Scrape exactly one company by name. Useful for verifying cookies + Drive/DB writes end-to-end without burning through the CSV. Skips the row-number prefix in the JSON filename."
+      }
+    },
+    {
+      "name": "Batch — Run (manual range)",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/batch/run?filename=entities.csv&start_row=0&end_row=5",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "batch", "run"],
+          "query": [
+            {
+              "key": "filename",
+              "value": "entities.csv",
+              "description": "CSV inside INPUT_DIR"
+            },
+            {
+              "key": "start_row",
+              "value": "0"
+            },
+            {
+              "key": "end_row",
+              "value": "5",
+              "description": "Keep small for first local test"
+            }
+          ]
+        },
+        "description": "Manually start a batch over [start_row, end_row). Returns 409 if a batch is already running. Use a tiny range (e.g. 0..5) to verify end-to-end before unleashing it on the full CSV."
+      }
+    },
+    {
+      "name": "Export — Excel (singapore_contacts)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/export/excel",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "export", "excel"]
+        },
+        "description": "Download singapore_contacts as an .xlsx. Returns 404 until at least one row exists. In Postman, click 'Send and Download' to save the file."
+      }
+    },
+    {
+      "name": "Export — JSON Archive (zip)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/export/json-archive",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "export", "json-archive"]
+        },
+        "description": "Download every JSON file in JSON_DIR as one zip. Returns 404 until at least one JSON has been archived. Use 'Send and Download'."
+      }
+    }
+  ]
+}

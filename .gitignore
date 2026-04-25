@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+credentials/
+.cookies/
+json_data/
+__pycache__/
+*.pyc
+venv/
+
+# Local IDE / tool configs
+.claude/
+.vscode/
+.idea/
+
+# Only the gzipped CSV is committed; the decompressed copy is regenerated at startup.
+input_files/*.csv

@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+pandas
+psycopg2-binary
+pydantic
+openpyxl
+selenium
+webdriver-manager
+beautifulsoup4
+lxml
+python-dotenv
+google-api-python-client
+google-auth
+google-auth-oauthlib

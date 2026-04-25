@@ -1,0 +1,52 @@
+# Local dev stack — Postgres + the scraper API.
+# Production deploys to Render via render.yaml; this file is for local iteration.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: recordowl
+      POSTGRES_PASSWORD: recordowl
+      POSTGRES_DB: recordowl
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recordowl -d recordowl"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Primary (Neon) — set in .env. Falls back to the local container if unset.
+      DATABASE_URL: ${DATABASE_URL:-postgresql://recordowl:recordowl@postgres:5432/recordowl}
+      # Secondary (local Postgres container). Empty string disables dual-write.
+      SECONDARY_DATABASE_URL: ${SECONDARY_DATABASE_URL:-postgresql://recordowl:recordowl@postgres:5432/recordowl}
+      INPUT_CSV_FILENAME: ${INPUT_CSV_FILENAME:-entities.csv}
+      SCRAPE_START_ROW: ${SCRAPE_START_ROW:-0}
+      SCRAPE_END_ROW: ${SCRAPE_END_ROW:-500}
+      AUTO_START_SCRAPE: ${AUTO_START_SCRAPE:-false}
+      RATE_LIMIT_MIN: ${RATE_LIMIT_MIN:-3}
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-10}
+      GOOGLE_SERVICE_ACCOUNT_FILE: /app/credentials/service-account.json
+      GOOGLE_DRIVE_FOLDER_ID: ${GOOGLE_DRIVE_FOLDER_ID:-}
+      COOKIE_FILE: /app/.cookies/recordowl-cookies.json
+      PORT: "8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./.cookies:/app/.cookies
+      - ./credentials:/app/credentials
+      - ./input_files:/app/input_files
+      - ./json_data:/app/json_data
+
+volumes:
+  pgdata:
