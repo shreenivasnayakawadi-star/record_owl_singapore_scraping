@@ -8,20 +8,15 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Big local artefacts — never bake into the image.
-# input_files/*.csv.gz IS baked in (the gzipped CSV ships with the repo).
-# input_files/*.csv is NOT — start.sh regenerates it via gunzip.
+# Local artefacts (never go in the image)
+# entities.csv.gz IS baked in; the decompressed copy is read on demand by pandas.
 input_files/*.csv
-json_data/
 .cookies/
 credentials/
 
 # Editor / OS
 .vscode/
 .idea/
+.claude/
 .DS_Store
 Thumbs.db
-
-# Docs / scripts not needed at runtime
-README.md
-setup.sh

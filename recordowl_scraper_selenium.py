@@ -33,7 +33,7 @@ from bs4 import BeautifulSoup
 
 # ─────────────────────────── Constants ───────────────────────────────────────
 BASE_URL    = "https://recordowl.com"
-COOKIE_FILE = ".cookies/recordowl-cookies.json"
+COOKIE_FILE = os.environ.get("COOKIE_FILE", "/tmp/recordowl-cookies.json")
 
 # Rotating user-agents — required by SG scraping regulations for private sites.
 USER_AGENTS = [

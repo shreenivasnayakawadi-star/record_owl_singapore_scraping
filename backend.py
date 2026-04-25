@@ -1,12 +1,10 @@
 """
 backend.py — RecordOwl Scraper API + batch worker.
 
-Batch lifecycle:
-  • On startup: ensure DB tables, then auto-start the batch *only if* a cookies
-    file is already present (so redeploys resume seamlessly).
-  • First deploy: no cookies on disk → POST /api/cookies/upload kicks off the batch
-    using SCRAPE_START_ROW / SCRAPE_END_ROW from env.
-  • Each scraped company is fanned out to: Postgres + local JSON archive + Google Drive.
+Free-tier flow:
+  • POST /api/cookies/upload → save cookies (ephemeral) + kick off batch
+  • Each row: scrape → write to Neon (DB) + upload JSON to Google Drive
+  • No local disk, no JSON archive, no dual-write
 """
 
 from dotenv import load_dotenv
@@ -17,7 +15,6 @@ import io
 import json
 import os
 import random
-import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
 
@@ -38,11 +35,11 @@ from db import (
     save_to_contacts,
     slugify,
 )
-from gdrive import upload_json_to_drive, safe_filename
+from gdrive import upload_json, safe_filename
 
 # ─────────────────────────── App init ────────────────────────────────────────
 
-app = FastAPI(title="RecordOwl Scraper", version="5.0.0")
+app = FastAPI(title="RecordOwl Scraper", version="6.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,15 +51,15 @@ app.add_middleware(
 
 # ─────────────────────────── Config from env ─────────────────────────────────
 
-COOKIE_FILE    = os.environ.get("COOKIE_FILE", ".cookies/recordowl-cookies.json")
-INPUT_DIR      = os.environ.get("INPUT_DIR", "input_files")
-JSON_DIR       = os.environ.get("JSON_DIR", "json_data")
+# Cookies are written to a writable path inside the container. Free-tier
+# filesystem is ephemeral, but cookies are re-uploaded per deploy anyway.
+COOKIE_FILE = os.environ.get("COOKIE_FILE", "/tmp/recordowl-cookies.json")
+INPUT_DIR   = os.environ.get("INPUT_DIR", "input_files")
 
 os.makedirs(os.path.dirname(COOKIE_FILE) or ".", exist_ok=True)
 os.makedirs(INPUT_DIR, exist_ok=True)
-os.makedirs(JSON_DIR, exist_ok=True)
 
-# Single-worker executor — Selenium + cookies aren't safe under concurrency.
+# Single-worker executor — Selenium isn't safe under concurrency.
 executor = ThreadPoolExecutor(max_workers=1)
 
 
@@ -81,91 +78,84 @@ class BatchStatus(BaseModel):
     skipped: int = 0
     total: int = 0
 
-# Global batch status tracker
 batch_status = BatchStatus()
 
 
-# ─────────────────────────── JSON archive + Drive ────────────────────────────
-
-def archive_and_upload(
-    company_name: str,
-    slug: str,
-    data: dict,
-    row_number: int | None = None,
-) -> str:
-    """
-    Save JSON locally, then upload to Google Drive.
-    Filename: "{row_number}_{company_name}.json" when row_number is provided,
-    else "{company_name}.json" (e.g. for /api/scrape/manual).
-    """
-    safe_name = safe_filename(company_name) or safe_filename(slug) or "unknown"
-    if row_number is not None:
-        filename = f"{row_number}_{safe_name}.json"
-    else:
-        filename = f"{safe_name}.json"
-    path = os.path.join(JSON_DIR, filename)
-
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"[JSON OK] archived -> {path}")
-    except Exception as e:
-        print(f"[JSON ERROR] {path}: {e}")
-        return path
-
-    # Upload to Google Drive (non-blocking — errors are logged, not raised)
-    try:
-        upload_json_to_drive(company_name, slug, data, path)
-    except Exception as e:
-        print(f"[GDRIVE UPLOAD ERROR] {company_name}: {e}")
-
-    return path
-
-
-# ─────────────────────────── Full save pipeline ──────────────────────────────
+# ─────────────────────────── Save pipeline ───────────────────────────────────
 
 def full_save(data: dict, row_number: int | None = None) -> bool:
     """
-    Save to DB (contacts + completed) and archive JSON to disk + Drive.
-    `row_number` is the 0-based CSV row index; included in the JSON filename.
+    Persist a scraped company:
+      1. Upsert into Neon (singapore_contacts + companies_completed)
+      2. Upload JSON to Google Drive (in-memory, no local file)
     """
     saved = save_to_contacts(data)
 
     slug         = data.get("slug", "")
     company_name = (data.get("overview") or {}).get("company_name", slug)
 
-    archive_and_upload(company_name, slug, data, row_number=row_number)
+    safe_name = safe_filename(company_name) or safe_filename(slug) or "unknown"
+    if row_number is not None:
+        filename = f"{row_number}_{safe_name}.json"
+    else:
+        filename = f"{safe_name}.json"
+
+    try:
+        upload_json(filename, data)
+    except Exception as e:
+        print(f"[GDRIVE UPLOAD ERROR] {filename}: {e}")
+
     return saved
 
 
 # ─────────────────────────── Batch logic ─────────────────────────────────────
 
+def _read_csv_slice(filepath: str, start_row: int, end_row: int) -> pd.DataFrame:
+    """
+    Read only rows [start_row, end_row) from the CSV (gz-aware).
+    Free-tier 512MB RAM can't fit a 220MB pandas frame, so we slice with
+    skiprows + nrows to keep memory usage small.
+    """
+    nrows = max(0, end_row - start_row)
+    if nrows == 0:
+        return pd.DataFrame()
+    return pd.read_csv(
+        filepath,
+        header=0,
+        dtype=str,
+        skiprows=range(1, start_row + 1) if start_row > 0 else None,
+        nrows=nrows,
+    )
+
+
+def _resolve_csv_path() -> str | None:
+    """Find the configured CSV (or its .gz) in INPUT_DIR."""
+    name = os.environ.get("INPUT_CSV_FILENAME", "entities.csv")
+    for candidate in (
+        os.path.join(INPUT_DIR, name),
+        os.path.join(INPUT_DIR, name + ".gz"),
+    ):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 async def run_batch_logic(filepath: str, start_row: int, end_row: int) -> None:
-    """
-    Process rows [start_row, end_row) from the CSV.
-    Skips any company already in companies_completed.
-    """
+    """Process rows [start_row, end_row). Skips rows already in companies_completed."""
     global batch_status
 
-    df = pd.read_csv(filepath, header=0, dtype=str)
-    total = len(df)
-    start = max(0, start_row)
-    end   = min(total, end_row)
-
-    if start >= end:
-        print(f"[BATCH] Nothing to process: start={start} end={end} total={total}")
+    df = _read_csv_slice(filepath, start_row, end_row)
+    if df.empty:
+        print(f"[BATCH] Nothing to process: start={start_row} end={end_row}")
         return
 
-    subset = df.iloc[start:end]
-
-    # Fetch already-completed companies for skip logic
-    print("[BATCH] Loading completed companies from DB...")
+    print("[BATCH] Loading completed companies from Neon...")
     completed_numbers = fetch_completed_companies()
     completed_slugs   = fetch_completed_slugs()
     print(f"[BATCH] {len(completed_numbers)} companies already completed")
 
     batch_status.running = True
-    batch_status.total   = len(subset)
+    batch_status.total   = len(df)
     batch_status.processed = 0
     batch_status.skipped   = 0
 
@@ -173,17 +163,17 @@ async def run_batch_logic(filepath: str, start_row: int, end_row: int) -> None:
     rate_min = float(os.environ.get("RATE_LIMIT_MIN", "3"))
     rate_max = float(os.environ.get("RATE_LIMIT_MAX", "10"))
 
-    for idx, row in subset.iterrows():
+    for offset, row in df.reset_index(drop=True).iterrows():
+        actual_row = start_row + offset
         entity_name     = str(row.get("entity_name", "")).strip()
         uen_status_desc = str(row.get("uen_status_desc", "")).strip().lower()
 
         if not entity_name or entity_name.lower() == "nan" or uen_status_desc == "deregistered":
-            print(f"[BATCH] Row {idx}: empty/deregistered, skipping")
+            print(f"[BATCH] Row {actual_row}: empty/deregistered, skipping")
             batch_status.skipped += 1
             batch_status.processed += 1
             continue
 
-        # ── Skip if already completed ────────────────────────────────────
         entity_slug = slugify(entity_name)
         uen = str(row.get("uen", "")).strip()
 
@@ -208,7 +198,6 @@ async def run_batch_logic(filepath: str, start_row: int, end_row: int) -> None:
                 result = await loop.run_in_executor(
                     executor, scrape_company, entity_name, True,
                 )
-                # 404 from RecordOwl is permanent — don't retry.
                 if result and result.get("not_found"):
                     print(f"[404] {entity_name}: page does not exist, no retries")
                     break
@@ -235,17 +224,12 @@ async def run_batch_logic(filepath: str, start_row: int, end_row: int) -> None:
             )
             scraped_name = (result.get("overview") or {}).get("company_name")
             try:
-                full_save(result, row_number=int(idx))
+                full_save(result, row_number=actual_row)
 
-                # After saving, refresh local caches so we don't re-scrape
-                # if the same company appears again in the CSV
                 reg_no = (result.get("overview") or {}).get("registration_number")
                 if reg_no:
                     completed_numbers.add(reg_no)
 
-                # If the page never rendered a company_name, save_to_contacts
-                # skipped the DB write. Still mark the CSV's UEN as failed so
-                # we don't retry this row on every subsequent batch.
                 if not scraped_name and uen:
                     print(f"[BATCH] {entity_name}: no company_name, marking UEN {uen} as failed")
                     mark_completed(uen, entity_name, status="failed")
@@ -255,8 +239,6 @@ async def run_batch_logic(filepath: str, start_row: int, end_row: int) -> None:
             except Exception as e:
                 print(f"[ERROR] {entity_name} save: {e}")
         else:
-            # Mark as attempted even if scrape failed, to avoid infinite retries
-            # Use entity_name as both number and name if we have nothing else
             if uen:
                 mark_completed(uen, entity_name, status="failed")
                 completed_numbers.add(uen)
@@ -276,40 +258,28 @@ async def run_batch_logic(filepath: str, start_row: int, end_row: int) -> None:
 # ─────────────────────────── Batch trigger ───────────────────────────────────
 
 def _kickoff_batch_from_env() -> Dict[str, Any]:
-    """
-    Start the batch from env-configured CSV + range, unless one is already running.
-    Returns a status dict the caller can include in its HTTP response.
-    """
     if batch_status.running:
         return {"started": False, "reason": "batch already running"}
 
-    csv_filename = os.environ.get("INPUT_CSV_FILENAME", "entities.csv")
-    start_row    = int(os.environ.get("SCRAPE_START_ROW", "0"))
-    end_row      = int(os.environ.get("SCRAPE_END_ROW", "500"))
-    filepath     = os.path.join(INPUT_DIR, csv_filename)
+    start_row = int(os.environ.get("SCRAPE_START_ROW", "0"))
+    end_row   = int(os.environ.get("SCRAPE_END_ROW", "500"))
+    filepath  = _resolve_csv_path()
 
-    if not os.path.exists(filepath):
-        return {"started": False, "reason": f"CSV not found at {filepath}"}
+    if not filepath:
+        return {
+            "started": False,
+            "reason": f"CSV not found at {INPUT_DIR}/{os.environ.get('INPUT_CSV_FILENAME', 'entities.csv')}",
+        }
 
-    print(f"[KICKOFF] {csv_filename} rows [{start_row}, {end_row})")
+    print(f"[KICKOFF] {filepath} rows [{start_row}, {end_row})")
     asyncio.create_task(run_batch_logic(filepath, start_row, end_row))
-    return {
-        "started":   True,
-        "file":      csv_filename,
-        "start_row": start_row,
-        "end_row":   end_row,
-    }
+    return {"started": True, "file": filepath, "start_row": start_row, "end_row": end_row}
 
 
-# ─────────────────────────── Startup event ───────────────────────────────────
+# ─────────────────────────── Startup ─────────────────────────────────────────
 
 @app.on_event("startup")
 async def on_startup():
-    """
-    On server start: just ensure DB tables exist. The batch is *only* started
-    when POST /api/cookies/upload arrives — never on startup, even if cookies
-    are already on disk from a previous deploy.
-    """
     print("[STARTUP] Initializing...")
     try:
         ensure_tables()
@@ -322,10 +292,7 @@ async def on_startup():
 
 @app.get("/api/health")
 async def health():
-    return {
-        "status": "ok",
-        "batch": batch_status.dict(),
-    }
+    return {"status": "ok", "batch": batch_status.dict()}
 
 
 @app.get("/api/batch/status")
@@ -335,20 +302,15 @@ async def get_batch_status():
 
 @app.post("/api/cookies/upload")
 async def upload_cookies(body: CookieData):
-    """
-    Save cookies and, if AUTO_START_SCRAPE=true, immediately kick off the batch
-    using SCRAPE_START_ROW / SCRAPE_END_ROW from env.
-    """
+    """Save cookies (ephemeral). If AUTO_START_SCRAPE=true, kick off the batch."""
     with open(COOKIE_FILE, "w", encoding="utf-8") as f:
         json.dump(body.cookies, f, indent=2)
 
     response: Dict[str, Any] = {"status": "success", "count": len(body.cookies)}
-
     if os.environ.get("AUTO_START_SCRAPE", "false").lower() == "true":
         response["batch"] = _kickoff_batch_from_env()
     else:
         response["batch"] = {"started": False, "reason": "AUTO_START_SCRAPE=false"}
-
     return response
 
 
@@ -358,7 +320,6 @@ async def manual_scrape(req: ManualScrapeRequest):
     result = await loop.run_in_executor(executor, scrape_company, req.company_name, True)
     saved = full_save(result)
     people_with_email = [p for p in result.get("people", []) if p.get("email")]
-
     return {
         "status":            "completed",
         "saved":             saved,
@@ -370,27 +331,21 @@ async def manual_scrape(req: ManualScrapeRequest):
 
 
 @app.post("/api/batch/run")
-async def start_batch(
-    filename: str,
-    start_row: int,
-    end_row: int,
-    background_tasks: BackgroundTasks,
-):
+async def start_batch(start_row: int, end_row: int, background_tasks: BackgroundTasks):
     if batch_status.running:
         raise HTTPException(status_code=409, detail="A batch is already running")
-
-    file_path = os.path.join(INPUT_DIR, filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail=f"CSV not found: {filename}")
     if start_row < 0 or end_row <= start_row:
         raise HTTPException(status_code=400, detail=f"Invalid range: {start_row}-{end_row}")
-
-    background_tasks.add_task(run_batch_logic, file_path, start_row, end_row)
-    return {"status": "batch_started", "file": filename, "start_row": start_row, "end_row": end_row}
+    filepath = _resolve_csv_path()
+    if not filepath:
+        raise HTTPException(status_code=404, detail="CSV not found in INPUT_DIR")
+    background_tasks.add_task(run_batch_logic, filepath, start_row, end_row)
+    return {"status": "batch_started", "file": filepath, "start_row": start_row, "end_row": end_row}
 
 
 @app.get("/api/export/excel")
 async def export_to_excel():
+    """Stream singapore_contacts as .xlsx (Neon → openpyxl)."""
     try:
         query = """
             SELECT registration_number, company_name, contact_no, email
@@ -400,7 +355,6 @@ async def export_to_excel():
         """
         with get_connection() as conn:
             df = pd.read_sql_query(query, conn)
-
         if df.empty:
             raise HTTPException(status_code=404, detail="No leads found.")
 
@@ -421,32 +375,8 @@ async def export_to_excel():
         raise HTTPException(status_code=500, detail="Export failed.")
 
 
-@app.get("/api/export/json-archive")
-async def export_json_archive():
-    """Stream every archived JSON file as a single ZIP."""
-    if not os.path.isdir(JSON_DIR):
-        raise HTTPException(status_code=404, detail="JSON archive directory does not exist")
-
-    files = sorted(f for f in os.listdir(JSON_DIR) if f.endswith(".json"))
-    if not files:
-        raise HTTPException(status_code=404, detail="No JSON files to export")
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fname in files:
-            zf.write(os.path.join(JSON_DIR, fname), arcname=fname)
-    buf.seek(0)
-
-    return StreamingResponse(
-        buf,
-        headers={"Content-Disposition": 'attachment; filename="recordowl_json_archive.zip"'},
-        media_type="application/zip",
-    )
-
-
 @app.get("/api/completed/count")
 async def completed_count():
-    """How many companies have been processed so far."""
     try:
         with get_connection() as conn:
             with conn.cursor() as cur:

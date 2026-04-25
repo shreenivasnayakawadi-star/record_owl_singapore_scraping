@@ -1,62 +1,35 @@
-# Render Blueprint — managed Postgres + Google Drive + persistent disk.
+# Render Blueprint — free-tier deployment.
 #
-# Data flow per scraped company:
-#   1. Postgres  → Render managed DB (set via DATABASE_URL below)
-#   2. Drive     → Google Drive folder (uploaded by gdrive.py)
-#   3. Disk      → /app/data (also exposed via /api/export/json-archive + /api/export/excel)
+# All persistent state lives off-Render:
+#   - DB    → Neon Postgres (DATABASE_URL)
+#   - JSON  → Google Drive (OAuth env vars + GOOGLE_DRIVE_FOLDER_ID)
+# The container itself is fully ephemeral. Cookies are uploaded per session.
 #
-# All three run together. Disk also holds cookies, service-account JSON, and input CSVs.
-#
-# Deploy: push to GitHub → Render → New → Blueprint → pick the repo, then in the
-# dashboard set GOOGLE_DRIVE_FOLDER_ID. Upload service-account.json + cookies via
-# the Render shell (or POST /api/cookies/upload) into /app/data/credentials and /app/data/cookies.
-#
-# To switch to a remote/external DB (e.g. Neon) instead of Render's managed Postgres:
-#   - Delete the `databases:` block
-#   - Replace the `fromDatabase` DATABASE_URL entry with `sync: false` and paste the URL in the dashboard
-#
-databases:
-  - name: recordowl-db
-    plan: basic-256mb
-    databaseName: recordowl
-    user: recordowl
+# Set the `sync: false` env vars in the Render dashboard after first deploy.
 
 services:
   - type: web
     name: recordowl-scraper
     runtime: docker
-    plan: starter            # Selenium + Chrome won't fit on free tier
+    plan: free
     dockerfilePath: ./Dockerfile
     healthCheckPath: /api/health
     autoDeploy: true
 
-    disk:
-      name: recordowl-data
-      mountPath: /app/data
-      sizeGB: 1
-
     envVars:
-      # Primary = Neon. Set the URL in the Render dashboard (sync: false).
+      # Neon Postgres URL — paste in dashboard
       - key: DATABASE_URL
         sync: false
-      # Secondary = Render's managed Postgres (the `databases:` block above).
-      # Every successful Neon write is mirrored here; failures here are logged only.
-      - key: SECONDARY_DATABASE_URL
-        fromDatabase:
-          name: recordowl-db
-          property: connectionString
 
-      # Persistent paths on the mounted disk
-      - key: COOKIE_FILE
-        value: /app/data/cookies/recordowl-cookies.json
-      - key: GOOGLE_OAUTH_CLIENT_FILE
-        value: /app/data/credentials/oauth_client.json
-      - key: GOOGLE_OAUTH_TOKEN_FILE
-        value: /app/data/credentials/oauth_token.json
-      - key: JSON_DIR
-        value: /app/data/json_data
-      # INPUT_DIR is intentionally NOT overridden — entities.csv ships in the image
-      # at /app/input_files (default), so it's available without disk seeding.
+      # Google Drive (OAuth user creds — produced by `python oauth_setup.py` locally)
+      - key: GOOGLE_OAUTH_CLIENT_ID
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_OAUTH_REFRESH_TOKEN
+        sync: false
+      - key: GOOGLE_DRIVE_FOLDER_ID
+        sync: false
 
       # Scrape config
       - key: INPUT_CSV_FILENAME
@@ -71,7 +44,3 @@ services:
         value: "3"
       - key: RATE_LIMIT_MAX
         value: "10"
-
-      # Set in Render dashboard (sync: false keeps it out of git)
-      - key: GOOGLE_DRIVE_FOLDER_ID
-        sync: false

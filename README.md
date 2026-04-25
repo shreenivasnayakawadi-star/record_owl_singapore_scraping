@@ -1,23 +1,20 @@
 # RecordOwl Scraper
 
-FastAPI + Selenium scraper that fans each scraped company out to **Postgres + a local JSON archive + Google Drive**, with a batch worker that resumes across redeploys.
+FastAPI + Selenium scraper. Each scraped company is written to **Neon Postgres** and uploaded as JSON to **Google Drive**. No local volumes, no Docker complexity, no managed databases on Render — everything persistent lives off the platform.
 
 ## Data flow
 
 ```
-POST /api/cookies/upload
-        │
-        ▼
-  cookies saved to disk  ──► auto-starts batch (AUTO_START_SCRAPE=true)
-                                     │
-                                     ▼
-                          for each row in CSV [start, end):
-                                     │
-                ┌────────────────────┼────────────────────┐
-                ▼                    ▼                    ▼
-       Postgres (DB)        Local volume (disk)      Google Drive
-   singapore_contacts        json_data/*.json         day folders
-   companies_completed
+POST /api/cookies/upload   →   batch starts
+                                   │
+                                   ▼
+                       for each row in CSV [start..end):
+                                   │
+                ┌──────────────────┴─────────────────┐
+                ▼                                    ▼
+         Neon Postgres                        Google Drive
+   singapore_contacts (leads)            day-folder / row_company.json
+   companies_completed (skip-set)
 ```
 
 ## Endpoints
@@ -25,67 +22,78 @@ POST /api/cookies/upload
 | Method | Path | Purpose |
 |---|---|---|
 | GET  | `/api/health` | Health + batch status |
-| GET  | `/api/batch/status` | Just the batch status |
+| GET  | `/api/batch/status` | Batch progress |
 | POST | `/api/cookies/upload` | Upload cookies; auto-kicks the batch |
 | POST | `/api/scrape/manual` | Scrape one company by name |
-| POST | `/api/batch/run?filename=&start_row=&end_row=` | Manually start a batch |
+| POST | `/api/batch/run?start_row=&end_row=` | Manual batch range |
 | GET  | `/api/export/excel` | Download `singapore_contacts` as `.xlsx` |
-| GET  | `/api/export/json-archive` | Download every JSON file as a `.zip` |
 | GET  | `/api/completed/count` | Scraped vs failed totals |
 
-## Local dev (Docker Compose)
+## One-time setup (do once locally)
 
-```bash
-cp .env.example .env       # set GOOGLE_DRIVE_FOLDER_ID etc.
-docker compose up --build
+### Neon
+1. Sign up at https://neon.tech, create a project + database.
+2. Copy the connection string (with `?sslmode=require`). This is `DATABASE_URL`.
+
+### Google OAuth (so Drive uploads bill against your 15 GB user quota — service accounts can't do this)
+
+1. https://console.cloud.google.com/apis/credentials → enable Drive API.
+2. **OAuth consent screen** → Internal (Workspace) or External + add yourself as test user.
+3. **Credentials → + Create Credentials → OAuth client ID → Desktop app** → download JSON, save as `credentials/oauth_client.json`.
+4. Run the local helper to mint a refresh token:
+   ```bash
+   python oauth_setup.py
+   ```
+   Browser opens → sign in → allow. It writes `credentials/oauth_token.json`.
+
+### Extract OAuth values for Render env vars
+
+Open both files; the values you'll need are:
+
+| Env var | Where it's from |
+|---|---|
+| `GOOGLE_OAUTH_CLIENT_ID` | `oauth_client.json` → `installed.client_id` |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | `oauth_client.json` → `installed.client_secret` |
+| `GOOGLE_OAUTH_REFRESH_TOKEN` | `oauth_token.json` → `refresh_token` |
+| `GOOGLE_DRIVE_FOLDER_ID` | The `…/folders/<id>` part of your Drive folder URL |
+
+Quick PowerShell extractor:
+```powershell
+python -c "import json; c=json.load(open('credentials/oauth_client.json'))['installed']; t=json.load(open('credentials/oauth_token.json')); print('CLIENT_ID:    ',c['client_id']); print('CLIENT_SECRET:',c['client_secret']); print('REFRESH_TOKEN:',t['refresh_token'])"
 ```
 
-The compose file runs Postgres in a sibling container with a named volume; the app binds `./input_files`, `./json_data`, `./.cookies`, `./credentials` for local iteration.
-
-Place your `entities.csv` in `input_files/` and your `service-account.json` in `credentials/`, then `POST /api/cookies/upload`.
-
-## Deploy to Render
+## Deploy to Render (free tier)
 
 1. Push the repo to GitHub.
-2. Render → **New → Blueprint** → pick the repo. The blueprint provisions:
-   - Managed Postgres (`recordowl-db`)
-   - Web service (Docker, starter plan)
-   - 1 GB persistent disk at `/app/data`
-3. In the Render dashboard, set `GOOGLE_DRIVE_FOLDER_ID`.
-4. Open the Render shell and drop the input CSV + service-account.json onto the disk:
-   ```
-   /app/data/input_files/entities.csv
-   /app/data/credentials/service-account.json
-   ```
-5. `POST /api/cookies/upload` with the cookies JSON. The batch starts immediately and uses `SCRAPE_START_ROW` / `SCRAPE_END_ROW` from env.
+2. Render → **+ New → Blueprint** → pick the repo. It reads `render.yaml` and proposes one web service.
+3. **Apply / Create Resources**.
+4. Once the service is created, open it → **Environment** tab. Set the five `sync: false` vars:
+   - `DATABASE_URL` (Neon)
+   - `GOOGLE_OAUTH_CLIENT_ID`
+   - `GOOGLE_OAUTH_CLIENT_SECRET`
+   - `GOOGLE_OAUTH_REFRESH_TOKEN`
+   - `GOOGLE_DRIVE_FOLDER_ID`
+5. Render redeploys. After it boots, hit `/api/health` → should return `{"status":"ok"}`.
+6. `POST /api/cookies/upload` with your RecordOwl cookies → batch fires using `SCRAPE_START_ROW..END_ROW`.
 
-Redeploys: cookies persist on the disk, so the batch auto-resumes without you having to re-upload.
+## Free-tier caveats
 
-## Environment variables
-
-See [`.env.example`](.env.example). The important ones:
-
-| Var | Purpose |
-|---|---|
-| `DATABASE_URL` | Postgres URL (Render sets this from the managed DB) |
-| `GOOGLE_SERVICE_ACCOUNT_FILE` | Path to the Drive service-account JSON |
-| `GOOGLE_DRIVE_FOLDER_ID` | Drive root folder ID (leave empty to disable Drive uploads) |
-| `INPUT_DIR` / `JSON_DIR` / `COOKIE_FILE` | Persistent paths (point at `/app/data/...` on Render) |
-| `INPUT_CSV_FILENAME` | CSV inside `INPUT_DIR` |
-| `SCRAPE_START_ROW` / `SCRAPE_END_ROW` | Range to process |
-| `AUTO_START_SCRAPE` | `true` to auto-kick on cookie upload + on restart-with-cookies |
-| `RATE_LIMIT_MIN` / `RATE_LIMIT_MAX` | Per-company sleep range (seconds) |
+- **15 min idle spin-down** — first request after idle takes ~30s to wake up.
+- **512 MB RAM** — tight for Selenium+Chrome. If you hit OOM, upgrade to Starter ($7/mo).
+- **Ephemeral filesystem** — cookies are lost on every redeploy. Re-upload via `/api/cookies/upload`. (Drive uploads aren't affected; they're remote.)
 
 ## Project layout
 
 ```
 backend.py                  FastAPI app + batch worker
-db.py                       Postgres layer (companies_completed + singapore_contacts)
-gdrive.py                   Google Drive uploads (no-op when folder id unset)
+db.py                       Neon Postgres layer
+gdrive.py                   Drive upload (OAuth via env vars, in-memory)
 recordowl_scraper_selenium.py
+oauth_setup.py              One-time refresh-token mint
 requirements.txt
-Dockerfile / start.sh       Container build + entrypoint
-docker-compose.yml          Local dev: app + Postgres
-render.yaml                 Render blueprint
+Dockerfile                  Used by Render to install Chrome
+render.yaml                 Render Blueprint
 .env.example
+input_files/entities.csv.gz Input CSV (gzipped, ~57 MB)
+postman_collection.json     API client
 ```
